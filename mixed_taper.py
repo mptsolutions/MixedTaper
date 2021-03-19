@@ -67,10 +67,7 @@ class Window(QMainWindow, Ui_MainWindow):
         release = self.sd.get_release(self.tracker['RELEASES'][row_index]['RELEASE_ID'])
         tracks = self.sd.query_songs(discogs_release_id=release['RELEASE_ID'])
         if tracks == []:
-            discogs_tracks = self.sd.get_track_list(release['RELEASE_ID'])
-            for track in discogs_tracks:
-                self.sd.insert_song(track['title'], release['TITLE'], release['ARTIST'], 
-                                     track['duration'], release['RELEASE_ID'], track['position'])
+            _ = self.sd.get_track_list(release['RELEASE_ID'])
             tracks = self.sd.query_songs(discogs_release_id=release['RELEASE_ID'])
         self.track_list.setRowCount(len(tracks))
         for row, track in enumerate(tracks):

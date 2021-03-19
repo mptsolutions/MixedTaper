@@ -3,9 +3,10 @@ import pathlib
 import sqlite3
 from os import path
 from sqlite3.dbapi2 import DatabaseError
+from time import sleep
 
 class SimpleDiscogs:
-    def __init__(self, discogs_user_id, discogs_user_token, user_agent='SimpleDiscogs/0.1', database_location=None):
+    def __init__(self, discogs_user_id, discogs_user_token, user_agent='SimpleDiscogs/0.2', database_location=None):
         self.discogs_user_id = discogs_user_id
         self.discogs_user_token = discogs_user_token
         self.discogs_headers = {'User-Agent': user_agent}
@@ -18,8 +19,7 @@ class SimpleDiscogs:
             self.database_file = path.join(database_location, 'simple_discogs.sqlite')
         else:
             self.database_file = './simple_discogs.sqlite'
-        if not pathlib.Path(self.database_file).is_file():
-            self.update_releases()
+        self.update_releases()
 
     def clean_time(self, time_value):
         sections = time_value.split(':')
@@ -36,42 +36,48 @@ class SimpleDiscogs:
             raise DatabaseError
         return conn, conn.cursor()
 
-    def get_releases_from_discogs(self):
-        response = requests.get(self.user_releases_url + '&per_page=100', headers=self.discogs_headers)
+    def get_releases_from_discogs(self, known_releases=[]):
+        response = requests.get(self.user_releases_url + '&per_page=200', headers=self.discogs_headers)
         pagination = response.json()['pagination']
         releases = response.json()['releases']
-
-        if pagination['items'] > 100:
+        calls_limit_remaining = int(response.headers['X-Discogs-Ratelimit-Remaining'])
+        if pagination['items'] > 200:
             for page in range(2, pagination['pages'] + 1):
-                response = requests.get(self.user_releases_url + '&per_page=100&page=' + str(page), headers=self.discogs_headers)
+                if calls_limit_remaining <=0:
+                    sleep(61)
+                response = requests.get(self.user_releases_url + '&per_page=200&page=' + str(page), headers=self.discogs_headers)
                 releases += response.json()['releases']
-
+                calls_limit_remaining = int(response.headers['X-Discogs-Ratelimit-Remaining'])
+        new_releases = []
         for release in releases:
-            if release['basic_information']['year'] == 0:
+            if int(release['basic_information']['id']) not in known_releases:
                 master_url = 'https://api.discogs.com/masters/' + str(release['basic_information']['master_id'])
-                master_url += '?per_page=100&token=' + self.discogs_user_token
+                master_url += '?token=' + self.discogs_user_token
+                if calls_limit_remaining <=0:
+                    sleep(61)
                 response = requests.get(master_url, headers=self.discogs_headers)
-
+                calls_limit_remaining = int(response.headers['X-Discogs-Ratelimit-Remaining'])
+                if 'genres' in response.json():
+                    release['basic_information']['genres'] = response.json()['genres']
+                if 'styles' in response.json():
+                    release['basic_information']['styles'] = response.json()['styles']
                 if 'year' in response.json():
                     release['basic_information']['year'] = response.json()['year']
-        return releases
+                new_releases.append(release)
+        return new_releases
 
     def update_releases(self):
-        releases = self.get_releases_from_discogs()
         conn, cursor = self.connect_to_database()
         if conn and cursor:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
             table_list = [row[0] for row in cursor.fetchall()]
 
-            if 'RELEASES' in table_list:
-                cursor.execute('DROP TABLE RELEASES')
+            if 'RELEASES' not in table_list:
+                sql_statement = 'CREATE TABLE RELEASES (' + ','.join(self.release_fields) + ')'
+                sql_statement = sql_statement.replace('RELEASE_ID', 'RELEASE_ID INTEGER PRIMARY KEY')
+                sql_statement = sql_statement.replace('DATE_ADDED', 'DATE_ADDED DATETIME')
+                cursor.execute(sql_statement)
                 conn.commit()
-
-            sql_statement = 'CREATE TABLE RELEASES (' + ','.join(self.release_fields) + ')'
-            sql_statement = sql_statement.replace('RELEASE_ID', 'RELEASE_ID INTEGER PRIMARY KEY')
-            sql_statement = sql_statement.replace('DATE_ADDED', 'DATE_ADDED DATETIME')
-            cursor.execute(sql_statement)
-            conn.commit()
 
             if 'SONGS' not in table_list:
                 sql_statement = f'CREATE TABLE SONGS ({",".join(self.song_fields)})'
@@ -79,6 +85,11 @@ class SimpleDiscogs:
                 sql_statement = sql_statement.replace('DISCOGS_RELEASE_ID', 'DISCOGS_RELEASE_ID INTEGER')
                 cursor.execute(sql_statement)
                 conn.commit()
+
+            sql_statement = f'SELECT RELEASE_ID FROM RELEASES'
+            cursor.execute(sql_statement)
+            release_ids = [row[0] for row in cursor.fetchall()]
+            releases = self.get_releases_from_discogs(known_releases=release_ids)
 
             for release in releases:
                 clean_release = {}
@@ -160,7 +171,7 @@ class SimpleDiscogs:
                 cursor.execute(select_statement, (selection, ))
             elif category == 'all':
                 select_statement = 'SELECT ' + ','.join(self.release_fields) + ' FROM RELEASES '
-                select_statement += 'ORDER BY ARTIST COLLATE NOCASE ASC, DECADE ASC, TITLE COLLATE NOCASE ASC'
+                select_statement += 'ORDER BY ARTIST COLLATE NOCASE ASC, YEAR ASC, TITLE COLLATE NOCASE ASC'
                 cursor.execute(select_statement)
             elif category and selection:
                 select_statement = 'SELECT ' + ','.join(self.release_fields) + ' FROM RELEASES WHERE '
@@ -168,7 +179,10 @@ class SimpleDiscogs:
                 select_statement += category.upper() + ' LIKE ? OR '
                 select_statement += category.upper() + ' LIKE ? OR '
                 select_statement += category.upper() + ' LIKE ? '
-                select_statement += 'COLLATE NOCASE ORDER BY ARTIST ASC, DECADE ASC, TITLE ASC'
+                if category.upper() == 'YEAR' or category.upper() == 'DECADE':
+                    select_statement += 'COLLATE NOCASE ORDER BY YEAR ASC, ARTIST ASC, TITLE ASC'
+                else:
+                    select_statement += 'COLLATE NOCASE ORDER BY ARTIST ASC, YEAR ASC, TITLE ASC'
                 cursor.execute(select_statement, (selection, selection + '|%', '%|' + selection + '|%', '%|' + selection))
             else:
                 conn.close()
@@ -227,13 +241,18 @@ class SimpleDiscogs:
         return video_list
 
     def get_track_list(self, release_id):
-        release_url = 'https://api.discogs.com/releases/' + str(release_id)
-        release_url += '?per_page=100&token=' + self.discogs_user_token
-        response = requests.get(release_url, headers=self.discogs_headers)
-        if response.json()['tracklist']:
-            tracklist = response.json()['tracklist']
+        tracklist = []
+        songs = self.query_songs(discogs_release_id=release_id)
+        if songs == []:
+            release_url = 'https://api.discogs.com/releases/' + str(release_id)
+            release_url += '?token=' + self.discogs_user_token
+            response = requests.get(release_url, headers=self.discogs_headers)
+            if response.json()['tracklist']:
+                tracklist = response.json()['tracklist']
+                for track in tracklist:
+                    self.insert_song(track['title'], response.json()['title'], response.json()['artists'][0]['name'], track['duration'], release_id, track['position'])
         else:
-            tracklist = []
+            tracklist = [{'position':song['DISCOGS_RELEASE_TRACK'], 'title':song['TITLE']} for song in songs]
         return tracklist
     
     def insert_song(self, title, release, artist, length, discogs_release_id, discogs_release_track):
